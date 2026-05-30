@@ -307,6 +307,159 @@ def draw(components, board, ax, title):
             ax.plot(wp[0], wp[1], "o", color="#225", markersize=1.8, zorder=3)
 
 
+# ---------- KiCad PCB import ----------
+#
+# KiCad uses S-expressions and a Y-down coordinate frame. We negate Y on read
+# so the internal frame is Y-up (matches matplotlib and the rest of the code).
+# Footprint bbox is estimated from pad extents + a small margin -- not perfect
+# (real bbox is in the F.CrtYd courtyard layer) but adequate for placement.
+# Edge.Cuts arcs are not handled; gr_line and gr_rect only.
+
+
+def parse_sexp(text):
+    tokens, i, n = [], 0, len(text)
+    while i < n:
+        c = text[i]
+        if c.isspace():
+            i += 1
+        elif c in "()":
+            tokens.append(c)
+            i += 1
+        elif c == '"':
+            j = i + 1
+            while j < n and text[j] != '"':
+                j += 2 if text[j] == "\\" else 1
+            tokens.append(text[i : j + 1])
+            i = j + 1
+        else:
+            j = i
+            while j < n and not text[j].isspace() and text[j] not in "()":
+                j += 1
+            tokens.append(text[i:j])
+            i = j
+    p = [0]
+
+    def parse():
+        if tokens[p[0]] != "(":
+            t = tokens[p[0]]
+            p[0] += 1
+            return t
+        p[0] += 1
+        out = []
+        while tokens[p[0]] != ")":
+            out.append(parse())
+        p[0] += 1
+        return out
+
+    return parse()
+
+
+def _find(node, tag):
+    return [c for c in node if isinstance(c, list) and c and c[0] == tag]
+
+
+def _first(node, tag):
+    for c in node:
+        if isinstance(c, list) and c and c[0] == tag:
+            return c
+    return None
+
+
+def _unq(s):
+    return s[1:-1] if isinstance(s, str) and len(s) >= 2 and s[0] == '"' == s[-1] else s
+
+
+def _chain_segments(segs, tol=0.01):
+    """Walk a soup of (start, end) segments into a single polygon."""
+    if not segs:
+        return None
+    k = lambda p: (round(p[0] / tol) * tol, round(p[1] / tol) * tol)
+    rem = list(segs)
+    poly = [rem[0][0], rem[0][1]]
+    rem.pop(0)
+    while rem:
+        last = k(poly[-1])
+        for i, (a, b) in enumerate(rem):
+            if k(a) == last:
+                poly.append(b)
+                rem.pop(i)
+                break
+            if k(b) == last:
+                poly.append(a)
+                rem.pop(i)
+                break
+        else:
+            break
+    if len(poly) > 1 and k(poly[0]) == k(poly[-1]):
+        poly.pop()
+    return np.array(poly)
+
+
+def import_kicad_pcb(path):
+    root = parse_sexp(open(path).read())
+    comps = {}
+
+    for fp in _find(root, "footprint"):
+        ref = next(
+            (_unq(p[2]) for p in _find(fp, "property") if _unq(p[1]) == "Reference"),
+            None,
+        )
+        if not ref:
+            continue
+        at = _first(fp, "at")
+        fx, fy = float(at[1]), -float(at[2])
+        ftheta = np.radians(float(at[3])) if len(at) > 3 else 0.0
+
+        pins, xs, ys = [], [], []
+        for pad in _find(fp, "pad"):
+            pa = _first(pad, "at")
+            px, py = float(pa[1]), -float(pa[2])
+            nn = _first(pad, "net")
+            net = _unq(nn[2]) if nn else f"NC_{ref}_{_unq(pad[1])}"
+            pins.append(Pin(np.array([px, py]), net))
+            sz = _first(pad, "size")
+            sw, sh = float(sz[1]), float(sz[2])
+            xs.extend([px - sw / 2, px + sw / 2])
+            ys.extend([py - sh / 2, py + sh / 2])
+
+        hw = max(abs(min(xs)), abs(max(xs))) + 0.3 if xs else 1.5
+        hh = max(abs(min(ys)), abs(max(ys))) + 0.3 if ys else 1.5
+        comps[ref] = Component(
+            id=ref,
+            pos=np.array([fx, fy]),
+            theta=ftheta,
+            half_size=np.array([hw, hh]),
+            pins=pins,
+            allowed_orientations=QUAD,
+        )
+
+    segs = []
+    for gl in _find(root, "gr_line"):
+        ly = _first(gl, "layer")
+        if ly and _unq(ly[1]) == "Edge.Cuts":
+            s, e = _first(gl, "start"), _first(gl, "end")
+            segs.append(((float(s[1]), -float(s[2])), (float(e[1]), -float(e[2]))))
+    for gr in _find(root, "gr_rect"):
+        ly = _first(gr, "layer")
+        if ly and _unq(ly[1]) == "Edge.Cuts":
+            s, e = _first(gr, "start"), _first(gr, "end")
+            x1, y1 = float(s[1]), -float(s[2])
+            x2, y2 = float(e[1]), -float(e[2])
+            segs.extend(
+                [
+                    ((x1, y1), (x2, y1)),
+                    ((x2, y1), (x2, y2)),
+                    ((x2, y2), (x1, y2)),
+                    ((x1, y2), (x1, y1)),
+                ]
+            )
+
+    board = _chain_segments(segs)
+    for c in comps.values():
+        c.allowed_polygon = board
+    return comps, board
+
+
 # ---------- Example ----------
 
 
@@ -407,15 +560,39 @@ def build_example():
 
 
 if __name__ == "__main__":
-    components, swap_groups, board = build_example()
+    import sys
+
+    pcb = (
+        sys.argv[1] if len(sys.argv) > 1 else "/mnt/user-data/outputs/example.kicad_pcb"
+    )
+    components, board = import_kicad_pcb(pcb)
+
+    # Pick a couple of swap groups by component name (resistors with 2 pins
+    # whose endpoints are symmetric and interchangeable).
+    swap_groups = [SwapGroup(cid, [0, 1]) for cid in ("R1", "R2") if cid in components]
+
+    # Scramble initial positions so the "before" plot shows the placer doing work.
+    # Connectors (J*) are kept at their imported positions and pinned -- typical
+    # workflow is to place I/O first, then let the placer arrange everything else.
+    rng = np.random.default_rng(0)
+    xs, ys = board[:, 0], board[:, 1]
+    for c in components.values():
+        if c.id.startswith("J"):
+            c.fixed = True
+            continue
+        c.pos = rng.uniform([xs.min() + 2, ys.min() + 2], [xs.max() - 2, ys.max() - 2])
+        project_position(c)
+
     fig, axes = plt.subplots(1, 2, figsize=(14, 6))
     draw(components, board, axes[0], "Initial")
     run(components, swap_groups, n_iters=800)
     draw(components, board, axes[1], "Converged")
+
+    m = 3
     for ax in axes:
-        ax.set_xlim(-2, 32)
-        ax.set_ylim(-2, 22)
+        ax.set_xlim(xs.min() - m, xs.max() + m)
+        ax.set_ylim(ys.min() - m, ys.max() + m)
         ax.grid(alpha=0.2)
     plt.tight_layout()
-    plt.savefig("result.png", dpi=110)
+    plt.savefig("/mnt/user-data/outputs/placement.png", dpi=110)
     print("done")
