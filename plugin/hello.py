@@ -12,4 +12,8 @@ if __name__ == "__main__":
     footprints = board.get_footprints()
 
     for f in footprints:
-        print(f"{f.reference_field.text.value}")
+        print(f"ref: {f.reference_field.text.value}")
+        print(f"layer: {f.layer}")
+        print(f"locked: {f.locked}")
+        print(f"orientation: {f.orientation}")
+        print()
