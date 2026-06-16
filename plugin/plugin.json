@@ -15,7 +15,15 @@
                 "pcb"
             ],
             "entrypoint": "run.py",
-            "show-button": true
+            "show-button": true,
+            "icons-light": [
+                "icons/icon-24.png",
+                "icons/icon-48.png"
+            ],
+            "icons-dark": [
+                "icons/icon-24.png",
+                "icons/icon-48.png"
+            ]
         }
     ]
 }
