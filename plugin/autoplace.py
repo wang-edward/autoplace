@@ -7,6 +7,7 @@ from kipy.board_types import (
 from dataclasses import dataclass, field
 import numpy as np
 import torch
+import wx
 
 
 @dataclass
@@ -129,6 +130,10 @@ def get_components(board):
     return components
 
 
+class Cancel(Exception):
+    pass
+
+
 def place(
     components,
     edges,
@@ -139,6 +144,7 @@ def place(
     M=64,
     lam_max=50.0,
     verbose=True,
+    on_step=None,
 ):
     """Optimize positions + rotations in place. Returns (components, history)."""
     ids = list(components)
@@ -262,6 +268,8 @@ def place(
         history["den"].append(den.item())
         history["overflow"].append(overflow)
         history["lam"].append(lam)
+        if on_step is not None and on_step(it, n_iters, history) is False:
+            raise Cancel
         if verbose and it % 100 == 0:
             print(
                 f"it {it:4d}  WL {wl.item():9.2f}  lam*density {den.item():8.2f}  "
@@ -341,6 +349,7 @@ def write_back(board, components, message="autoplace"):
 
 
 if __name__ == "__main__":
+    ITERS = 1000
     try:
         kicad = KiCad()
         print(f"Connected to KiCad {kicad.get_version()}")
@@ -354,10 +363,26 @@ if __name__ == "__main__":
     components, edges = get_components(board), get_edge_cuts(board)
     print(f"{len(components)} components, initial HPWL = {hpwl(components):.1f}")
 
-    # fig, axes = plt.subplots(1, 2, figsize=(15, 6))
-    # draw(components, edges, f"initial (HPWL {hpwl(components):.0f})", axes[0])
-    place(components, edges)
-    legalize(components, edges)
-    # draw(components, edges, f"placed (HPWL {hpwl(components):.0f})", axes[1])
-    # plt.tight_layout()
-    write_back(board, components)
+    app = wx.App(False)
+    dlg = wx.ProgressDialog(
+        "autoplace",
+        "starting…",
+        maximum=ITERS,
+        style=wx.PD_APP_MODAL | wx.PD_AUTO_HIDE | wx.PD_ELAPSED_TIME | wx.PD_CAN_ABORT,
+    )
+
+    def on_step(it, n, hist):
+        cont, _ = dlg.Update(
+            it + 1,
+            f"{it + 1}/{n}   WL {hist['wl'][-1]:.0f}   overflow {hist['overflow'][-1]:.1f}",
+        )
+        return cont  # Cancel button -> False
+
+    try:
+        place(components, edges, n_iters=ITERS, on_step=on_step)
+        legalize(components, edges)
+        write_back(board, components)
+    except Cancel:
+        pass  # don't writeback
+
+    dlg.Destroy()
