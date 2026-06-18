@@ -14,7 +14,7 @@
             "scopes": [
                 "pcb"
             ],
-            "entrypoint": "run.py",
+            "entrypoint": "autoplace.py",
             "show-button": true,
             "icons-light": [
                 "icons/icon-24.png",
