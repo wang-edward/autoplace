@@ -19,3 +19,5 @@ cp -r autoplace/ ~/Documents/KiCad/10.0/plugins/  # KiCad 10
 ```bash
 cp -r autoplace/ ~/.local/share/KiCad/10.0/plugins/  # KiCad 10
 ```
+
+The idea is based on the DreamPlace algorithm: https://github.com/limbo018/DREAMPlace
