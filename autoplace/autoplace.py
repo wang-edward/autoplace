@@ -186,9 +186,6 @@ def place(
             ]
         )
 
-    # def pin_pos(i, off):
-    #     c, s = torch.cos(theta[i]), torch.sin(theta[i])
-    #     return pos[i] + torch.stack([c * off[0] - s * off[1], s * off[0] + c * off[1]])
     def pin_pos(i, off):
         c, s = torch.cos(theta[i]), torch.sin(theta[i])
         return pos[i] + torch.stack(
