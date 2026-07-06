@@ -25,6 +25,7 @@ class Component:
     anchor_offset: np.ndarray = field(default_factory=lambda: np.zeros(2))
     pins: list = field(default_factory=list)
     fixed: bool = False
+    flipped: bool = False  # on B.Cu
 
 
 def rot(theta):
@@ -124,6 +125,7 @@ def get_components(board):
             half_size=half,
             pins=pins,
             fixed=fp.locked,
+            flipped=(fp.layer == BoardLayer.BL_B_Cu),
             anchor_offset=Rinv
             @ (anchor - center),  # center->anchor vector, neutral frame
         )
@@ -140,13 +142,14 @@ def place(
     n_iters=1000,
     lr_pos=None,
     lr_theta=0.05,
+    lr_side=0.05,
     gamma=1.0,
     M=64,
     lam_max=50.0,
     verbose=True,
     on_step=None,
 ):
-    """Optimize positions + rotations in place. Returns (components, history)."""
+    """Optimize positions + rotations + sides in place. Returns (components, history)."""
     ids = list(components)
     hs = torch.tensor(
         np.array([components[c].half_size for c in ids]), dtype=torch.float32
@@ -162,6 +165,12 @@ def place(
     fixed = torch.tensor([components[c].fixed for c in ids])
     fixed_pos = pos.detach().clone()
     fixed_theta = theta.detach().clone()
+
+    f = torch.tensor([float(components[c].flipped) for c in ids])
+    z = (2 * f - 1) * 1.5  # sigmoid(+-1.5) ~ 0.18/0.82: committed but persuadable
+    z[fixed] *= 6.0  # locked parts: effectively hard 0/1
+    z.requires_grad_(True)
+    z0 = z.detach().clone()
 
     lo = torch.tensor(edges[0], dtype=torch.float32)
     hi = torch.tensor(edges[2], dtype=torch.float32)
@@ -186,10 +195,11 @@ def place(
             ]
         )
 
-    def pin_pos(i, off):
+    def pin_pos(i, off, mx):
         c, s = torch.cos(theta[i]), torch.sin(theta[i])
+        ox = off[0] * mx[i]  # mirror in the local frame, then rotate
         return pos[i] + torch.stack(
-            [c * off[0] + s * off[1], -s * off[0] + c * off[1]]
+            [c * ox + s * off[1], -s * ox + c * off[1]]
         )  # [[c,s],[-s,c]]
 
     def hs_eff():
@@ -198,10 +208,10 @@ def place(
             [c * hs[:, 0] + s * hs[:, 1], c * hs[:, 1] + s * hs[:, 0]], dim=1
         )
 
-    def wa_wirelength():
+    def wa_wirelength(mx):
         total = 0.0
         for members in net_pins:
-            pts = torch.stack([pin_pos(i, off) for i, off in members])
+            pts = torch.stack([pin_pos(i, off, mx) for i, off in members])
             for d in range(2):
                 x = pts[:, d]
                 total = (
@@ -215,7 +225,7 @@ def place(
     by = torch.linspace(lo[1], hi[1], M + 1)
     bin_area = (bx[1] - bx[0]) * (by[1] - by[0])
 
-    def density_map():
+    def density_map(side):
         h = hs_eff()
         ox = (
             torch.minimum(pos[:, 0:1] + h[:, 0:1], bx[None, 1:])
@@ -225,11 +235,11 @@ def place(
             torch.minimum(pos[:, 1:2] + h[:, 1:2], by[None, 1:])
             - torch.maximum(pos[:, 1:2] - h[:, 1:2], by[None, :-1])
         ).clamp(min=0)
-        return torch.einsum("ni,nj->ij", ox, oy) / bin_area
+        return torch.einsum("sn,ni,nj->sij", side, ox, oy) / bin_area  # (2, M, M)
 
     def electro_energy(rho):
         q = (rho - 1.0).clamp(min=0)  # only over-capacity density is charge
-        q = q - q.mean()  # neutralize for the periodic solve
+        q = q - q.mean(dim=(-2, -1), keepdim=True)  # neutralize per side
         fx = torch.fft.fftfreq(M) * 2 * np.pi
         k2 = fx[:, None] ** 2 + fx[None, :] ** 2
         k2[0, 0] = 1.0
@@ -237,30 +247,46 @@ def place(
         return 0.5 * (q * phi).sum()
 
     opt = torch.optim.Adam(
-        [{"params": [pos], "lr": lr_pos}, {"params": [theta], "lr": lr_theta}]
+        [
+            {"params": [pos], "lr": lr_pos},
+            {"params": [theta], "lr": lr_theta},
+            {"params": [z], "lr": lr_side},
+        ]
     )
-    lam, snap_w = 1e-3, 0.0
+    lam, snap_w, bin_w = 1e-3, 0.0, 0.0
     history = {"wl": [], "den": [], "overflow": [], "lam": []}
 
     for it in range(n_iters):
         opt.zero_grad()
-        wl = wa_wirelength()
-        den = lam * electro_energy(density_map())
+        s = torch.sigmoid(z)  # occupancy of B.Cu
+        m = s + f * (1 - 2 * s)  # prob. of sitting opposite the imported side
+        mx = 1 - 2 * m  # +1 as-imported ... -1 mirrored
+        side = torch.stack([1 - s, s])  # (2, N) front/back weights
+        wl = wa_wirelength(mx)
+        den = lam * electro_energy(density_map(side))
         snap = snap_w * torch.sin(2 * theta).pow(2).sum()
-        (wl + den + snap).backward()
+        binar = bin_w * (s * (1 - s)).sum()  # anneal s to 0/1, like the theta snap
+        (wl + den + snap + binar).backward()
         opt.step()
         with torch.no_grad():
             pos.data[fixed] = fixed_pos[fixed]
             theta.data[fixed] = fixed_theta[fixed]
+            z.data[fixed] = z0[fixed]
             h = hs_eff()
             pos.data = torch.max(torch.min(pos, hi - h), lo + h)
-            overflow = ((density_map() - 1.0).clamp(min=0).sum() * bin_area).item()
+            s_ = torch.sigmoid(z)
+            overflow = (
+                (density_map(torch.stack([1 - s_, s_])) - 1.0).clamp(min=0).sum()
+                * bin_area
+            ).item()
+            amb = int(((s_ > 0.1) & (s_ < 0.9)).sum())  # parts still undecided
         if overflow > tol:
             lam = min(lam * 1.03, lam_max)
         elif overflow < 0.5 * tol:
             lam *= 0.97
         if it > 0.4 * n_iters:
             snap_w = min(snap_w + 0.02, 5.0)
+            bin_w = min(bin_w + 0.02, 5.0)
         history["wl"].append(wl.item())
         history["den"].append(den.item())
         history["overflow"].append(overflow)
@@ -270,19 +296,28 @@ def place(
         if verbose and it % 100 == 0:
             print(
                 f"it {it:4d}  WL {wl.item():9.2f}  lam*density {den.item():8.2f}  "
-                f"lam {lam:.4f}  overflow {overflow:7.2f}"
+                f"lam {lam:.4f}  overflow {overflow:7.2f}  undecided {amb}"
             )
 
-    with torch.no_grad():  # legalize rotation
+    with torch.no_grad():  # legalize rotation + side
         theta.data = torch.round(theta / (np.pi / 2)) * (np.pi / 2)
         theta.data[fixed] = fixed_theta[fixed]
+        back = torch.sigmoid(z) > 0.5
+        back[fixed] = f[fixed] > 0.5
         h = hs_eff()
         pos.data = torch.max(torch.min(pos, hi - h), lo + h)
 
     p, t = pos.detach().numpy(), theta.detach().numpy()
+    MIR = np.diag([-1.0, 1.0])
     for i, cid in enumerate(ids):
-        components[cid].pos = p[i].astype(float)
-        components[cid].theta = float(t[i])
+        comp = components[cid]
+        comp.pos = p[i].astype(float)
+        comp.theta = float(t[i])
+        if bool(back[i]) != comp.flipped:  # bake the mirror into the local frame
+            for pin in comp.pins:
+                pin.local_pos = MIR @ pin.local_pos
+            comp.anchor_offset = MIR @ comp.anchor_offset
+            comp.flipped = bool(back[i])
     return components, history
 
 
@@ -304,6 +339,8 @@ def legalize(components, edges, iters=300):
         for i in range(len(ids)):
             for j in range(i + 1, len(ids)):
                 a, b = components[ids[i]], components[ids[j]]
+                if a.flipped != b.flipped:
+                    continue
                 d = b.pos - a.pos
                 pen = (eff_half(a) + eff_half(b)) - np.abs(d)  # per-axis penetration
                 if np.all(pen > 0):  # boxes intersect
@@ -324,7 +361,46 @@ def legalize(components, edges, iters=300):
     return components
 
 
-def write_back(board, components, message="autoplace"):
+def frame_angle(A, B):
+    """Rotation phi minimizing sum |A_i - rot(phi) @ B_i| over matched points (2D Kabsch)."""
+    A, B = np.asarray(A, float).reshape(-1, 2), np.asarray(B, float).reshape(-1, 2)
+    if len(A) == 0:
+        return 0.0
+    D = float((A * B).sum())
+    C = float((A[:, 0] * B[:, 1] - A[:, 1] * B[:, 0]).sum())
+    return float(np.arctan2(C, D)) if (C or D) else 0.0
+
+
+def write_back(kicad, board, components, message="autoplace"):
+    # The IPC API cannot flip by writing fp.layer: FOOTPRINT::Deserialize calls
+    # SetLayer (a relabel), never Flip. So side changes go through the real flip
+    # action on a selection; then re-read the truly mirrored geometry and solve
+    # for the pose that lands it where the model wants it.
+    fps = {fp.reference_field.text.value: fp for fp in board.get_footprints()}
+    to_flip = [
+        ref
+        for ref, comp in components.items()
+        if ref in fps
+        and not comp.fixed
+        and comp.flipped != (fps[ref].layer == BoardLayer.BL_B_Cu)
+    ]
+    if to_flip:
+        board.clear_selection()
+        board.add_to_selection([fps[r] for r in to_flip])
+        status = kicad.run_action("pcbnew.InteractiveEdit.flip").status
+        board.clear_selection()
+        fresh = get_components(board)
+        for ref in to_flip:
+            comp, fc = components[ref], fresh[ref]
+            if fc.flipped != comp.flipped:
+                raise RuntimeError(f"flip didn't take on {ref} (status {status})")
+            phi = frame_angle(
+                [p.local_pos for p in comp.pins], [p.local_pos for p in fc.pins]
+            )  # rotation aligning KiCad's post-flip frame to the model's baked frame
+            comp.theta += phi  # theta absorbs the frame difference...
+            comp.pins = fc.pins  # ...so we can adopt KiCad's own frame verbatim
+            comp.anchor_offset = fc.anchor_offset
+
     commit = board.begin_commit()
     try:
         changed = []
@@ -378,7 +454,7 @@ if __name__ == "__main__":
     try:
         place(components, edges, n_iters=ITERS, on_step=on_step)
         legalize(components, edges)
-        write_back(board, components)
+        write_back(kicad, board, components)
     except Cancel:
         pass  # don't writeback
 
